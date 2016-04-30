@@ -899,3 +899,179 @@ modbus_t* modbus_new_tcp_pi(const char *node, const char *service)
 
     return ctx;
 }
+
+/*
+ * prepare sockets for the protocol independent and multiple addresses.
+ * @param sock_list array containing sockets.
+ * @param sock_len the number of sockets.
+ */
+int modbus_tcp_pim_listen(modbus_t *ctx, int nb_connection,
+    int **sock_list, int *sock_len)
+{
+    int rc;
+    struct addrinfo *ai_list;
+    struct addrinfo *ai_ptr;
+    struct addrinfo ai_hints;
+    const char *node;
+    const char *service;
+    int *s_list, *s_realloc, s_len, s;
+
+    modbus_tcp_pi_t *ctx_tcp_pi;
+
+    if (ctx == NULL) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    ctx_tcp_pi = ctx->backend_data;
+
+#ifdef OS_WIN32
+    if (_modbus_tcp_init_win32() == -1) {
+        return -1;
+    }
+#endif
+
+    if (ctx_tcp_pi->node[0] == 0) {
+        node = NULL; /* == any */
+    } else {
+        node = ctx_tcp_pi->node;
+    }
+
+    if (ctx_tcp_pi->service[0] == 0) {
+        service = "502";
+    } else {
+        service = ctx_tcp_pi->service;
+    }
+
+    memset(&ai_hints, 0, sizeof (ai_hints));
+    /* If node is not NULL, than the AI_PASSIVE flag is ignored. */
+    ai_hints.ai_flags |= AI_PASSIVE;
+#ifdef AI_ADDRCONFIG
+    ai_hints.ai_flags |= AI_ADDRCONFIG;
+#endif
+    ai_hints.ai_family = AF_UNSPEC;
+    ai_hints.ai_socktype = SOCK_STREAM;
+    ai_hints.ai_addr = NULL;
+    ai_hints.ai_canonname = NULL;
+    ai_hints.ai_next = NULL;
+
+    ai_list = NULL;
+    rc = getaddrinfo(node, service, &ai_hints, &ai_list);
+    if (rc != 0) {
+        if (ctx->debug) {
+            fprintf(stderr, "Error returned by getaddrinfo: %s\n",
+                gai_strerror(rc));
+        }
+        errno = ECONNREFUSED;
+        return -1;
+    }
+
+    s_list = NULL;
+    s_len = 0;
+    for (ai_ptr = ai_list; ai_ptr != NULL; ai_ptr = ai_ptr->ai_next) {
+
+        s = socket(ai_ptr->ai_family, ai_ptr->ai_socktype,
+                            ai_ptr->ai_protocol);
+        if (s < 0) {
+            if (ctx->debug) {
+                perror("socket");
+            }
+            continue;
+        } else {
+            int yes = 1;
+            rc = setsockopt(s, SOL_SOCKET, SO_REUSEADDR,
+                            (void *) &yes, sizeof (yes));
+            if (rc != 0) {
+                close(s);
+                if (ctx->debug) {
+                    perror("setsockopt");
+                }
+                continue;
+            }
+        }
+
+        rc = bind(s, ai_ptr->ai_addr, ai_ptr->ai_addrlen);
+        if (rc != 0) {
+            close(s);
+            if (ctx->debug) {
+                perror("bind");
+            }
+            continue;
+        }
+
+        rc = listen(s, nb_connection);
+        if (rc != 0) {
+            close(s);
+            if (ctx->debug) {
+                perror("listen");
+            }
+            continue;
+        }
+
+        s_len++;
+        if ((s_realloc = realloc(s_list, s_len * sizeof(int *))) == NULL) {
+            fprintf(stderr, "malloc(s_list) failed\n");
+            if (s_list != NULL)
+                free(s_list);
+            errno = ENOMEM;
+            /* XXX should be cleaned all state */
+            return -1;
+        }
+        s_list = s_realloc;
+        s_list[s_len - 1] = s;
+    }
+    freeaddrinfo(ai_list);
+
+    *sock_list = s_list;
+    *sock_len = s_len;
+
+    return s_len;
+}
+
+/*
+ * deepcoy modbus_t except the socket.
+ * @note _modbus_tcp_free() releases backend_data and itself.
+ */
+modbus_t *modbus_copy_ctx(modbus_t *orig)
+{
+    modbus_t *new;
+
+    if ((new = malloc(sizeof(modbus_t))) == NULL) {
+        fprintf(stderr, "malloc(modbus_t) failed\n");
+        errno = ENOMEM;
+        return NULL;
+    }
+    new->slave = orig->slave;
+    new->s = 0; /* clear */
+    new->debug = orig->debug;
+    new->error_recovery = orig->error_recovery;
+    memcpy(&new->response_timeout, &orig->response_timeout,
+        sizeof(orig->response_timeout));
+    memcpy(&new->byte_timeout, &orig->byte_timeout,
+        sizeof(orig->byte_timeout));
+    new->backend = orig->backend;
+    switch (orig->backend->backend_type) {
+    case _MODBUS_BACKEND_TYPE_TCP:
+    {
+        if ((new->backend_data = malloc(sizeof(modbus_tcp_pi_t))) == NULL) {
+            fprintf(stderr, "malloc(modbus_tcp_pi_t) failed\n");
+            errno = ENOMEM;
+            return NULL;
+        }
+        modbus_tcp_pi_t *b_new = (modbus_tcp_pi_t *)new->backend_data;
+        modbus_tcp_pi_t *b_orig = (modbus_tcp_pi_t *)orig->backend_data;
+        b_new->t_id = b_orig->t_id;
+        b_new->port = b_orig->port;
+        memcpy(b_new->node, b_orig->node, _MODBUS_TCP_PI_NODE_LENGTH);
+        memcpy(b_new->service, b_orig->service, _MODBUS_TCP_PI_SERVICE_LENGTH);
+    }
+        break;
+    default:
+        fprintf(stderr, "unknown backend type %d\n",
+            orig->backend->backend_type);
+        errno = EINVAL;
+        return NULL;
+    }
+
+    return new;
+}
