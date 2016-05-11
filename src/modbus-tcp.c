@@ -902,8 +902,10 @@ modbus_t* modbus_new_tcp_pi(const char *node, const char *service)
 
 /*
  * prepare sockets for the protocol independent and multiple addresses.
- * @param sock_list array containing sockets.
+ * a list of sockets to be listened will be set into the array passed..
+ * @param sock_list a pointer to the array for sockets.
  * @param sock_len the number of sockets.
+ * @return a number of sockets in success. otherwise -1.
  */
 int modbus_tcp_pim_listen(modbus_t *ctx, int nb_connection,
     int **sock_list, int *sock_len)
